@@ -1,0 +1,128 @@
+#define BLYNK_TEMPLATE_ID "TMPL6o_xlwI3t"
+#define BLYNK_TEMPLATE_NAME "Seizure Detection Notification"
+#define BLYNK_AUTH_TOKEN "ZPxZ0HkbPGfESd3cRvT_EAN2P_jCftLG"
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// Wi-Fi credentials
+const char* ssid = "DESKTOP-UNLISSJ 7192";
+const char* pass = "5w29^84R";
+
+// Objects for sensors
+Adafruit_MPU6050 mpu;
+MAX30105 particleSensor;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+
+// Heart rate variables
+const byte RATE_SIZE = 8;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute = 0.0;
+int beatAvg = 0;
+
+// IR value thresholds
+const long IR_THRESHOLD = 70000;
+const long MIN_DELTA = 300;
+
+// Accelerometer threshold
+const float ACCEL_THRESHOLD = 1.5;
+
+// GSR sensor pin for ESP32
+const int GSR_PIN = 34;
+const int GSR_THRESHOLD = 2100;
+
+BlynkTimer timer;
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to Wi-Fi!");
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  Serial.println("Connected to Blynk!");
+
+  Wire.begin(21, 22);
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found!");
+    while (1);
+  }
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x2A);
+  particleSensor.setPulseAmplitudeIR(0x3F);
+  
+  if (!mpu.begin(0x68)) {
+    Serial.println("MPU6050 not found!");
+    while (1);
+  }
+
+  gpsSerial.begin(9600, SERIAL_8N1, 18, 19);
+  
+  Blynk.virtualWrite(V1, "No Seizure is Detected Yet");
+  Blynk.virtualWrite(V2, "No BPM Data Yet");
+  Blynk.virtualWrite(V0, "No Skin Capacitance Data Yet");
+  Blynk.virtualWrite(V3, "No GPS Data Yet");
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  long irValue = particleSensor.getIR();
+  if (irValue > IR_THRESHOLD && checkForBeat(irValue)) {
+    long delta = millis() - lastBeat;
+    if (delta > MIN_DELTA) {
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+      if (beatsPerMinute < 180 && beatsPerMinute > 40) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+        beatAvg /= RATE_SIZE;
+      }
+    }
+  }
+
+  sensors_event_t accelEvent;
+  mpu.getAccelerometerSensor()->getEvent(&accelEvent);
+  float resultantAccel = sqrt(accelEvent.acceleration.x * accelEvent.acceleration.x + 
+                              accelEvent.acceleration.y * accelEvent.acceleration.y + 
+                              accelEvent.acceleration.z * accelEvent.acceleration.z) / 9.8;
+
+  int gsrValue = analogRead(GSR_PIN);
+  bool isSeizure = resultantAccel > ACCEL_THRESHOLD;
+
+  if (isSeizure) {
+    Serial.println("Seizure Detected!");
+    sendBlynkAlert(beatAvg, gsrValue);
+    sendGPSLocation();
+  }
+}
+
+void sendBlynkAlert(int bpm, int gsr) {
+  Blynk.virtualWrite(V1, "Probability of seizure! Take action.");
+  Blynk.virtualWrite(V2, bpm);
+  Blynk.virtualWrite(V0, gsr);
+}
+
+void sendGPSLocation() {
+  while (gpsSerial.available() > 0) gps.encode(gpsSerial.read());
+  if (gps.location.isValid()) {
+    Blynk.virtualWrite(V3, String(gps.location.lat(), 6) + ", " + String(gps.location.lng(), 6));
+  } else {
+    Serial.println("GPS signal not available.");
+  }
+}
